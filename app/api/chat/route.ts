@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
 /** -----------------------
  *  Minimal in-memory session (OK for dev; swap to Redis later)
  *  ----------------------*/
@@ -16,17 +19,17 @@ function getS(id: string): Session {
 const products = {
   kumite: {
     name: "Kumite Strategy Playbook",
-    tcUrl: "https://cart.strategicrebel.com/kumite-strategy-playbook/",
+    tcUrl: "https://checkout.yourdomain.com/kumite-playbook",
     tag: "tc_kumite_core",
   },
   kata: {
     name: "Kata Mastery Blueprint",
-    tcUrl: "https://shotokankaraterebel.com/coming-soon/",
+    tcUrl: "https://checkout.yourdomain.com/kata-blueprint",
     tag: "tc_kata_core",
   },
   cond: {
     name: "Dojo Conditioning 30-Day",
-    tcUrl: "https://shotokankaraterebel.com/coming-soon/",
+    tcUrl: "https://checkout.yourdomain.com/conditioning",
     tag: "tc_cond_core",
   },
   mind: {
@@ -38,7 +41,6 @@ const products = {
 
 type Bucket = keyof typeof products;
 
-/** Build the ThriveCart deep link with prefill + tags */
 function buildCheckoutLink(bucket: Bucket, d: Record<string, string>) {
   const p = products[bucket];
   const u = new URL(p.tcUrl);
@@ -51,35 +53,38 @@ function buildCheckoutLink(bucket: Bucket, d: Record<string, string>) {
 }
 
 /** -----------------------
- *  CORS (set your live WP origin domains here)
+ *  CORS (echo back a single allowed origin)
  *  ----------------------*/
-const ALLOW = [
+const ALLOWED_ORIGINS = new Set<string>([
   "https://shotokankaraterebel.com",
   "https://www.shotokankaraterebel.com",
-  "http://localhost:3000", // dev preview
-  "https://sensei-bot.vercel.app", // vercel preview
-];
-function withCORS(res: NextResponse) {
-  res.headers.set("Access-Control-Allow-Origin", ALLOW.join(","));
-  res.headers.set("Vary", "Origin");
-  res.headers.set("Access-Control-Allow-Headers", "content-type");
-  res.headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-  return res;
+  "https://bot.shotokankaraterebel.com",
+  "http://localhost:3000",          // dev preview
+  "https://sensei-bot.vercel.app",  // vercel preview
+]);
+
+function makeCORSHeaders(req: Request) {
+  const origin = req.headers.get("origin") || "";
+  const allow = ALLOWED_ORIGINS.has(origin) ? origin : "";
+  return {
+    "Access-Control-Allow-Origin": allow, // must be a single origin or empty
+    "Vary": "Origin",
+    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+  };
 }
-export async function OPTIONS() {
-  return withCORS(new NextResponse(null, { status: 204 }));
+
+export async function OPTIONS(req: NextRequest) {
+  return new NextResponse(null, { status: 204, headers: makeCORSHeaders(req) });
 }
 
 /** -----------------------
- *  ✅ POST handler (unified signature + unified return)
- *  - Accepts clientState/clientData from the widget
- *  - Avoids early returns; always responds with { messages, checkoutUrl, nextState, nextData }
+ *  Unified POST handler (client-state aware)
  *  ----------------------*/
 export async function POST(req: NextRequest) {
-  // 1) Read request body (now includes client-provided state)
   const { sessionId, message, clientState, clientData } = await req.json();
 
-  // 2) Use client state if provided; otherwise fall back to in-memory (dev)
+  // Use client-provided state if present; otherwise use in-memory (dev)
   const s: Session = clientState
     ? { state: String(clientState), data: (clientData as any) || {} }
     : getS(String(sessionId));
@@ -88,12 +93,10 @@ export async function POST(req: NextRequest) {
   const out: Array<{ from: "bot" | "user"; text: string; buttons?: string[] }> = [];
   let checkoutUrl: string | undefined;
 
-  // 3) Initial greeting shortcut
+  // Hard reset on init to avoid stale sessions
   if (m === "__INIT__") {
-    // hard reset the server-side session for this visitor
     s.state = "consent";
-    s.data  = {};
-  
+    s.data = {};
     const res = NextResponse.json({
       messages: [
         {
@@ -104,13 +107,15 @@ export async function POST(req: NextRequest) {
         },
       ],
       checkoutUrl: undefined,
-      nextState: s.state, // "consent"
-      nextData: s.data,   // {}
+      nextState: s.state,
+      nextData: s.data,
     });
-    return withCORS(res);
+    const hdrs = makeCORSHeaders(req);
+    Object.entries(hdrs).forEach(([k, v]) => res.headers.set(k, v));
+    return res;
   }
 
-  // 4) FSM
+  // FSM
   switch (s.state) {
     case "consent": {
       if (/^yes$/i.test(m)) {
@@ -138,7 +143,6 @@ export async function POST(req: NextRequest) {
 
     case "goal": {
       s.data.goal = m;
-      // bucket selection
       if (/kumite/i.test(m)) s.data.bucket = "kumite";
       else if (/kata/i.test(m)) s.data.bucket = "kata";
       else if (/fit|flex/i.test(m)) s.data.bucket = "cond";
@@ -182,7 +186,6 @@ export async function POST(req: NextRequest) {
     }
 
     case "email": {
-      // basic validation
       if (!/\S+@\S+\.\S+/.test(m)) {
         out.push({ from: "bot", text: "Please enter a valid email (e.g. name@example.com)" });
         break;
@@ -219,7 +222,7 @@ export async function POST(req: NextRequest) {
           buttons: ["Yes, start now", "What’s inside?"],
         });
       }
-      // TODO: upsert to ESP here (ConvertKit/AC) using s.data
+      // TODO: upsert to ESP here if desired
       break;
     }
 
@@ -232,8 +235,7 @@ export async function POST(req: NextRequest) {
       } else {
         out.push({
           from: "bot",
-          text:
-            "Here’s what you’ll get: 6 core modules, 6 short videos, drills & a printable plan. Ready?",
+          text: "Here’s what you’ll get: 6 core modules, 6 short videos, drills & a printable plan. Ready?",
           buttons: ["Yes, start now", "Maybe later"],
         });
       }
@@ -258,7 +260,6 @@ export async function POST(req: NextRequest) {
       s.data.email = m;
       s.state = "end";
       out.push({ from: "bot", text: "Done—check your inbox in a minute. Oss!" });
-      // TODO: send cheatsheet via ESP
       break;
     }
 
@@ -272,12 +273,14 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // 5) Unified response (NO early returns inside switch)
   const res = NextResponse.json({
     messages: out,
-    checkoutUrl,      // string | undefined
+    checkoutUrl,
     nextState: s.state,
     nextData: s.data,
   });
-  return withCORS(res);
+  const hdrs = makeCORSHeaders(req);
+  Object.entries(hdrs).forEach(([k, v]) => res.headers.set(k, v));
+  return res;
 }
+
